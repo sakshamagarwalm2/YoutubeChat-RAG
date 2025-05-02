@@ -1,5 +1,7 @@
 # YouTubeChat RAG
 
+![YouTube ChatBot](https://github.com/sakshamagarwalm2/YoutubeChat-RAG/blob/main/Public/Screenshot%202025-05-02%20140643.png)
+
 A Retrieval-Augmented Generation (RAG) system that allows you to chat with YouTube videos by analyzing their transcripts. Ask questions about video content and get accurate, contextual answers powered by LLM and vector search technology.
 
 ## 📝 Table of Contents
