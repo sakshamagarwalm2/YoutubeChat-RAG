@@ -1,84 +1,195 @@
+"""
+RAG Pipeline for YouTube Chat Application
+This module implements a Retrieval-Augmented Generation pipeline
+for processing YouTube video transcripts and answering questions.
+"""
+
+import re
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_groq import ChatGroq
-from langchain_community.embeddings import HuggingFaceEmbeddings  # Updated import
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
+
 class RAGPipeline:
-    def __init__(self, youtube_url):
-        """Initialize the RAG pipeline with a YouTube URL."""
-        self.video_id = self.extract_video_id(youtube_url)
-        self.transcript = self.get_transcript()
-        self.chunks = self.split_transcript()
-        self.vector_store = self.create_vector_store()
-        self.retriever = self.vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-        self.llm = self.initialize_llm()
-        self.prompt = self.create_prompt()
-        self.main_chain = self.build_chain()
-
+    """RAG Pipeline for YouTube video transcripts."""
+    
+    def __init__(self, api_key=None):
+        """
+        Initialize the RAG Pipeline.
+        
+        Args:
+            api_key (str): Groq API key
+        """
+        self.api_key = api_key
+        self.vector_store = None
+        self.llm = None
+        self.chain = None
+        self.video_id = None
+        self.transcript = None
+    
     def extract_video_id(self, youtube_url):
-        """Extract the video ID from a YouTube URL."""
-        if "youtube.com/watch?v=" in youtube_url:
-            return youtube_url.split("v=")[1].split("&")[0]
-        elif "youtu.be/" in youtube_url:
-            return youtube_url.split("youtu.be/")[1].split("?")[0]
-        else:
-            raise ValueError("Invalid YouTube URL")
-
-    def get_transcript(self):
-        """Fetch the transcript for the YouTube video."""
+        """
+        Extract the video ID from a YouTube URL.
+        
+        Args:
+            youtube_url (str): YouTube URL
+            
+        Returns:
+            str: YouTube video ID
+        """
+        # Common YouTube URL patterns
+        patterns = [
+            r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+            r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]{11})',
+            r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/v\/([a-zA-Z0-9_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, youtube_url)
+            if match:
+                return match.group(1)
+        
+        # If the input is already just an ID (11 characters)
+        if re.match(r'^[a-zA-Z0-9_-]{11}$', youtube_url):
+            return youtube_url
+            
+        raise ValueError("Could not extract YouTube video ID from URL")
+    
+    def get_transcript(self, video_id):
+        """
+        Get the transcript for a YouTube video.
+        
+        Args:
+            video_id (str): YouTube video ID
+            
+        Returns:
+            str: Transcript text
+        """
         try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(self.video_id, languages=["en"])
-            return " ".join(chunk["text"] for chunk in transcript_list)
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            transcript = " ".join(chunk["text"] for chunk in transcript_list)
+            return transcript
         except TranscriptsDisabled:
-            raise Exception("No captions available for this video.")
-
-    def split_transcript(self):
-        """Split the transcript into chunks."""
+            raise ValueError("No captions available for this video.")
+        except Exception as e:
+            raise ValueError(f"Failed to fetch transcript: {str(e)}")
+    
+    def build_pipeline(self, transcript, api_key=None):
+        """
+        Build the RAG pipeline with the given transcript.
+        
+        Args:
+            transcript (str): Video transcript
+            api_key (str, optional): Groq API key
+            
+        Returns:
+            RunnableParallel: The assembled RAG pipeline
+        """
+        if api_key:
+            self.api_key = api_key
+            
+        if not self.api_key:
+            raise ValueError("Groq API key is required")
+        
+        # Split the transcript into chunks
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        return splitter.create_documents([self.transcript])
-
-    def create_vector_store(self):
-        """Create a vector store from the transcript chunks."""
+        chunks = splitter.create_documents([transcript])
+        
+        # Create embeddings and vector store
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        return FAISS.from_documents(self.chunks, embeddings)
-
-    def initialize_llm(self):
-        """Initialize the Groq LLM."""
-        return ChatGroq(
-            model="llama-3.3-70b-versatile",
+        self.vector_store = FAISS.from_documents(chunks, embeddings)
+        retriever = self.vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+        
+        # Initialize LLM
+        self.llm = ChatGroq(
+            api_key=self.api_key,
+            model="llama-3.1-70b-versatile",  # Using an available model
             temperature=0.2
         )
-
-    def create_prompt(self):
-        """Create the prompt template for the LLM."""
-        return PromptTemplate(
+        
+        # Create prompt template
+        prompt = PromptTemplate(
             template="""
-              You are a helpful assistant.
+              You are a helpful assistant answering questions about a YouTube video based on its transcript.
               Answer ONLY from the provided transcript context.
               If the context is insufficient, just say you don't know.
+              Keep your answers concise but informative.
 
               {context}
               Question: {question}
             """,
             input_variables=['context', 'question']
         )
-
-    def build_chain(self):
-        """Build the RAG chain."""
+        
+        # Format documents function
         def format_docs(retrieved_docs):
-            return "\n\n".join(doc.page_content for doc in retrieved_docs)
-
+            context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
+            return context_text
+        
+        # Build the chain
         parallel_chain = RunnableParallel({
-            'context': self.retriever | RunnableLambda(format_docs),
+            'context': retriever | RunnableLambda(format_docs),
             'question': RunnablePassthrough()
         })
+        
         parser = StrOutputParser()
-        return parallel_chain | self.prompt | self.llm | parser
-
-    def process_query(self, question):
-        """Process a user query and return the answer."""
-        return self.main_chain.invoke(question)
+        self.chain = parallel_chain | prompt | self.llm | parser
+        
+        return self.chain
+    
+    def initialize(self, youtube_url, api_key=None):
+        """
+        Initialize the RAG pipeline with a YouTube video.
+        
+        Args:
+            youtube_url (str): YouTube video URL
+            api_key (str, optional): Groq API key
+            
+        Returns:
+            dict: Status information
+        """
+        if api_key:
+            self.api_key = api_key
+            
+        try:
+            # Extract video ID
+            self.video_id = self.extract_video_id(youtube_url)
+            
+            # Get transcript
+            self.transcript = self.get_transcript(self.video_id)
+            
+            # Build pipeline
+            self.build_pipeline(self.transcript, self.api_key)
+            
+            return {
+                "status": "success",
+                "message": "RAG pipeline initialized successfully",
+                "video_id": self.video_id,
+                "transcript_length": len(self.transcript)
+            }
+        except Exception as e:
+            raise Exception(f"Failed to initialize RAG pipeline: {str(e)}")
+    
+    def answer_question(self, question):
+        """
+        Answer a question using the RAG pipeline.
+        
+        Args:
+            question (str): The question to answer
+            
+        Returns:
+            str: The answer
+        """
+        if not self.chain:
+            raise ValueError("RAG pipeline not initialized. Call initialize() first.")
+        
+        try:
+            answer = self.chain.invoke(question)
+            return answer
+        except Exception as e:
+            raise Exception(f"Failed to answer question: {str(e)}")
